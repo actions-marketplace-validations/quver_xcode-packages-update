@@ -1,33 +1,38 @@
 {
   "name": "xcode-packages-update",
-  "version": "3.1.1",
+  "version": "4.0.3",
   "description": "Resolves Xcode SPM dependencies and reports what changed",
   "type": "module",
   "engines": {
     "node": ">=24.0.0"
   },
   "scripts": {
-    "build": "esbuild src/main.entry.ts --bundle --platform=node --format=cjs --outfile=dist/main/index.cjs && esbuild src/post.entry.ts --bundle --platform=node --format=cjs --outfile=dist/post/index.cjs",
+    "build": "esbuild src/main.entry.ts --bundle --platform=node --format=cjs --define:__PACKAGE_VERSION__=\\\"$npm_package_version\\\" --outfile=dist/main/index.cjs && esbuild src/post.entry.ts --bundle --platform=node --format=cjs --outfile=dist/post/index.cjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
     "format:check": "prettier --check .",
     "format:write": "prettier --write .",
-    "all": "npm run format:write && npm run lint && npm run test && npm run build"
+    "all": "npm run format:write && npm run lint && npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "@actions/core": "^3.0.1",
     "@actions/exec": "^3.0.0"
   },
   "devDependencies": {
-    "@types/node": "^25.9.3",
-    "@vitest/coverage-v8": "^4.1.7",
-    "esbuild": "^0.28.1",
-    "eslint": "^10.4.0",
-    "globals": "^17.6.0",
-    "prettier": "^3.8.4",
+    "@types/node": "^26.3.0",
+    "@vitest/coverage-v8": "^4.1.11",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.9.1",
+    "globals": "^17.11.0",
+    "prettier": "^3.9.6",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.61.0",
+    "typescript-eslint": "^8.68.0",
     "vitest": "^4.0.18"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "fsevents@2.3.3": true
   }
 }
