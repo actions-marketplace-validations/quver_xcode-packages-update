@@ -6319,21 +6319,20 @@ var require_client_h1 = __commonJS({
     }
     function clearIdleSocketValidation(socket) {
       if (socket[kIdleSocketValidationTimeout]) {
-        clearTimeout(socket[kIdleSocketValidationTimeout]);
+        clearImmediate(socket[kIdleSocketValidationTimeout]);
         socket[kIdleSocketValidationTimeout] = null;
       }
       socket[kIdleSocketValidation] = 0;
     }
     function scheduleIdleSocketValidation(client, socket) {
       socket[kIdleSocketValidation] = 1;
-      socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+      socket[kIdleSocketValidationTimeout] = setImmediate(() => {
         socket[kIdleSocketValidationTimeout] = null;
         socket[kIdleSocketValidation] = 2;
         if (client[kSocket] === socket && !socket.destroyed) {
           client[kResume]();
         }
-      }, 0);
-      socket[kIdleSocketValidationTimeout].unref?.();
+      });
     }
     function resumeH1(client) {
       const socket = client[kSocket];
@@ -9032,6 +9031,7 @@ var require_retry_handler = __commonJS({
         this.end = null;
         this.etag = null;
         this.resume = null;
+        this.headersSent = false;
         this.handler.onConnect((reason) => {
           this.aborted = true;
           if (this.abort) {
@@ -9040,6 +9040,17 @@ var require_retry_handler = __commonJS({
             this.reason = reason;
           }
         });
+      }
+      checkpointResponseEnd(headers, resume) {
+        if (this.end == null && this.opts.method !== "HEAD") {
+          const contentLength = headers["content-length"];
+          this.end = contentLength != null ? Number(contentLength) - 1 : null;
+          assert(
+            this.end == null || Number.isFinite(this.end),
+            "invalid content-length"
+          );
+        }
+        this.resume = this.end != null ? resume : null;
       }
       onRequestSent() {
         if (this.handler.onRequestSent) {
@@ -9103,6 +9114,8 @@ var require_retry_handler = __commonJS({
         this.retryCount += 1;
         if (statusCode >= 300) {
           if (this.retryOpts.statusCodes.includes(statusCode) === false) {
+            this.headersSent = true;
+            this.checkpointResponseEnd(headers, resume);
             return this.handler.onHeaders(
               statusCode,
               rawHeaders,
@@ -9157,8 +9170,15 @@ var require_retry_handler = __commonJS({
             return false;
           }
           const { start, size, end = size - 1 } = contentRange;
-          assert(this.start === start, "content-range mismatch");
-          assert(this.end == null || this.end === end, "content-range mismatch");
+          if (this.start !== start || this.end != null && this.end !== end) {
+            this.abort(
+              new RequestRetryError("Content-Range mismatch", statusCode, {
+                headers,
+                data: { count: this.retryCount }
+              })
+            );
+            return false;
+          }
           this.resume = resume;
           return true;
         }
@@ -9166,6 +9186,7 @@ var require_retry_handler = __commonJS({
           if (statusCode === 206) {
             const range = parseRangeHeader(headers["content-range"]);
             if (range == null) {
+              this.headersSent = true;
               return this.handler.onHeaders(
                 statusCode,
                 rawHeaders,
@@ -9197,6 +9218,7 @@ var require_retry_handler = __commonJS({
             "invalid content-length"
           );
           this.resume = resume;
+          this.headersSent = true;
           this.etag = headers.etag != null ? headers.etag : null;
           if (this.etag != null && this.etag.startsWith("W/")) {
             this.etag = null;
@@ -9224,7 +9246,7 @@ var require_retry_handler = __commonJS({
         return this.handler.onComplete(rawTrailers);
       }
       onError(err) {
-        if (this.aborted || isDisturbed(this.opts.body)) {
+        if (this.aborted || isDisturbed(this.opts.body) || this.headersSent && this.resume == null) {
           return this.handler.onError(err);
         }
         if (this.retryCount - this.retryCountCheckpoint > 0) {
@@ -17110,7 +17132,7 @@ var require_connection = __commonJS({
           const secProtocol = response.headersList.get("Sec-WebSocket-Protocol");
           if (secProtocol !== null) {
             const requestProtocols = getDecodeSplit("sec-websocket-protocol", request.headersList);
-            if (!requestProtocols.includes(secProtocol)) {
+            if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
               failWebsocketConnection(ws, "Protocol was not set in the opening handshake.");
               return;
             }
@@ -17258,6 +17280,7 @@ var require_permessage_deflate = __commonJS({
             if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
               callback(new MessageSizeExceededError());
               this.#inflate.removeAllListeners();
+              this.#inflate.destroy();
               this.#inflate = null;
               return;
             }
@@ -18169,6 +18192,40 @@ var require_eventsource_stream = __commonJS({
     var CR = 13;
     var COLON = 58;
     var SPACE = 32;
+    var DATA = Buffer.from("data");
+    var EVENT = Buffer.from("event");
+    var ID = Buffer.from("id");
+    var RETRY = Buffer.from("retry");
+    function isASCIINumberBytes(buffer, start) {
+      if (start >= buffer.length) {
+        return false;
+      }
+      for (let i = start; i < buffer.length; i++) {
+        if (buffer[i] < 48 || buffer[i] > 57) {
+          return false;
+        }
+      }
+      return true;
+    }
+    function isValidLastEventIdBytes(buffer, start) {
+      for (let i = start; i < buffer.length; i++) {
+        if (buffer[i] === 0) {
+          return false;
+        }
+      }
+      return true;
+    }
+    function isFieldName(line, length, field) {
+      if (length !== field.length) {
+        return false;
+      }
+      for (let i = 0; i < length; i++) {
+        if (line[i] !== field[i]) {
+          return false;
+        }
+      }
+      return true;
+    }
     var EventSourceStream = class extends Transform {
       /**
        * @type {eventSourceSettings}
@@ -18188,10 +18245,13 @@ var require_eventsource_stream = __commonJS({
        */
       eventEndCheck = false;
       /**
-       * @type {Buffer}
+       * @type {Buffer[]}
        */
-      buffer = null;
+      chunks = [];
+      chunkIndex = 0;
       pos = 0;
+      lineChunkIndex = 0;
+      linePos = 0;
       event = {
         data: void 0,
         event: void 0,
@@ -18222,63 +18282,30 @@ var require_eventsource_stream = __commonJS({
           callback();
           return;
         }
-        if (this.buffer) {
-          this.buffer = Buffer.concat([this.buffer, chunk]);
-        } else {
-          this.buffer = chunk;
-        }
+        this.chunks.push(chunk);
         if (this.checkBOM) {
-          switch (this.buffer.length) {
-            case 1:
-              if (this.buffer[0] === BOM[0]) {
-                callback();
-                return;
-              }
-              this.checkBOM = false;
-              callback();
-              return;
-            case 2:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1]) {
-                callback();
-                return;
-              }
-              this.checkBOM = false;
-              break;
-            case 3:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1] && this.buffer[2] === BOM[2]) {
-                this.buffer = Buffer.alloc(0);
-                this.checkBOM = false;
-                callback();
-                return;
-              }
-              this.checkBOM = false;
-              break;
-            default:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1] && this.buffer[2] === BOM[2]) {
-                this.buffer = this.buffer.subarray(3);
-              }
-              this.checkBOM = false;
-              break;
+          if (this.handleBOM()) {
+            callback();
+            return;
           }
         }
-        while (this.pos < this.buffer.length) {
+        while (this.hasCurrentByte()) {
+          const byte = this.currentByte();
           if (this.eventEndCheck) {
             if (this.crlfCheck) {
-              if (this.buffer[this.pos] === LF) {
-                this.buffer = this.buffer.subarray(this.pos + 1);
-                this.pos = 0;
+              if (byte === LF) {
                 this.crlfCheck = false;
+                this.consumeCurrentByte();
                 continue;
               }
               this.crlfCheck = false;
             }
-            if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
-              if (this.buffer[this.pos] === CR) {
+            if (byte === LF || byte === CR) {
+              if (byte === CR) {
                 this.crlfCheck = true;
               }
-              this.buffer = this.buffer.subarray(this.pos + 1);
-              this.pos = 0;
-              if (this.event.data !== void 0 || this.event.event || this.event.id || this.event.retry) {
+              this.consumeCurrentByte();
+              if (this.hasPendingEvent()) {
                 this.processEvent(this.event);
               }
               this.clearEvent();
@@ -18287,17 +18314,16 @@ var require_eventsource_stream = __commonJS({
             this.eventEndCheck = false;
             continue;
           }
-          if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
-            if (this.buffer[this.pos] === CR) {
+          if (byte === LF || byte === CR) {
+            if (byte === CR) {
               this.crlfCheck = true;
             }
-            this.parseLine(this.buffer.subarray(0, this.pos), this.event);
-            this.buffer = this.buffer.subarray(this.pos + 1);
-            this.pos = 0;
+            this.parseLine(this.readLine(), this.event);
+            this.consumeCurrentByte();
             this.eventEndCheck = true;
             continue;
           }
-          this.pos++;
+          this.advanceCursor();
         }
         callback();
       }
@@ -18313,43 +18339,42 @@ var require_eventsource_stream = __commonJS({
         if (colonPosition === 0) {
           return;
         }
-        let field = "";
-        let value = "";
+        let fieldLength = line.length;
+        let valueStart = line.length;
         if (colonPosition !== -1) {
-          field = line.subarray(0, colonPosition).toString("utf8");
-          let valueStart = colonPosition + 1;
+          fieldLength = colonPosition;
+          valueStart = colonPosition + 1;
           if (line[valueStart] === SPACE) {
             ++valueStart;
           }
-          value = line.subarray(valueStart).toString("utf8");
-        } else {
-          field = line.toString("utf8");
-          value = "";
         }
-        switch (field) {
-          case "data":
-            if (event[field] === void 0) {
-              event[field] = value;
-            } else {
-              event[field] += `
+        if (isFieldName(line, fieldLength, DATA)) {
+          const value = line.toString("utf8", valueStart);
+          if (event.data === void 0) {
+            event.data = value;
+          } else {
+            event.data += `
 ${value}`;
-            }
-            break;
-          case "retry":
-            if (isASCIINumber(value)) {
-              event[field] = value;
-            }
-            break;
-          case "id":
-            if (isValidLastEventId(value)) {
-              event[field] = value;
-            }
-            break;
-          case "event":
-            if (value.length > 0) {
-              event[field] = value;
-            }
-            break;
+          }
+          return;
+        }
+        if (isFieldName(line, fieldLength, RETRY)) {
+          if (isASCIINumberBytes(line, valueStart)) {
+            event.retry = line.toString("utf8", valueStart);
+          }
+          return;
+        }
+        if (isFieldName(line, fieldLength, ID)) {
+          if (isValidLastEventIdBytes(line, valueStart)) {
+            event.id = line.toString("utf8", valueStart);
+          }
+          return;
+        }
+        if (isFieldName(line, fieldLength, EVENT)) {
+          const value = line.toString("utf8", valueStart);
+          if (value.length > 0) {
+            event.event = value;
+          }
         }
       }
       /**
@@ -18374,12 +18399,120 @@ ${value}`;
         }
       }
       clearEvent() {
-        this.event = {
-          data: void 0,
-          event: void 0,
-          id: void 0,
-          retry: void 0
-        };
+        this.event.data = void 0;
+        this.event.event = void 0;
+        this.event.id = void 0;
+        this.event.retry = void 0;
+      }
+      hasPendingEvent() {
+        return this.event.data !== void 0 || this.event.event !== void 0 || this.event.id !== void 0 || this.event.retry !== void 0;
+      }
+      hasCurrentByte() {
+        return this.chunkIndex < this.chunks.length && this.pos < this.chunks[this.chunkIndex].length;
+      }
+      currentByte() {
+        return this.chunks[this.chunkIndex][this.pos];
+      }
+      consumeCurrentByte() {
+        this.advanceCursor();
+        this.syncLineStartToCursor();
+      }
+      advanceCursor() {
+        this.pos++;
+        while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length) {
+          this.chunkIndex++;
+          this.pos = 0;
+        }
+      }
+      syncLineStartToCursor() {
+        this.lineChunkIndex = this.chunkIndex;
+        this.linePos = this.pos;
+        this.dropConsumedChunks();
+      }
+      dropConsumedChunks() {
+        while (this.lineChunkIndex > 0) {
+          this.chunks.shift();
+          this.lineChunkIndex--;
+          this.chunkIndex--;
+        }
+        if (this.chunkIndex === this.chunks.length) {
+          this.chunks.length = 0;
+          this.chunkIndex = 0;
+          this.pos = 0;
+          this.lineChunkIndex = 0;
+          this.linePos = 0;
+        }
+      }
+      readLine() {
+        if (this.lineChunkIndex === this.chunkIndex) {
+          return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos);
+        }
+        const chunks = [];
+        let length = 0;
+        for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+          const chunk = this.chunks[i];
+          const start = i === this.lineChunkIndex ? this.linePos : 0;
+          const end = i === this.chunkIndex ? this.pos : chunk.length;
+          const slice = chunk.subarray(start, end);
+          length += slice.length;
+          chunks.push(slice);
+        }
+        return Buffer.concat(chunks, length);
+      }
+      peekBufferedByte(offset) {
+        let chunkIndex = this.lineChunkIndex;
+        let pos = this.linePos;
+        while (chunkIndex < this.chunks.length) {
+          const chunk = this.chunks[chunkIndex];
+          const remaining = chunk.length - pos;
+          if (offset < remaining) {
+            return chunk[pos + offset];
+          }
+          offset -= remaining;
+          chunkIndex++;
+          pos = 0;
+        }
+      }
+      discardLeadingBytes(count) {
+        while (count > 0 && this.lineChunkIndex < this.chunks.length) {
+          const chunk = this.chunks[this.lineChunkIndex];
+          const remaining = chunk.length - this.linePos;
+          if (count < remaining) {
+            this.linePos += count;
+            count = 0;
+          } else {
+            count -= remaining;
+            this.lineChunkIndex++;
+            this.linePos = 0;
+          }
+        }
+        this.chunkIndex = this.lineChunkIndex;
+        this.pos = this.linePos;
+        this.dropConsumedChunks();
+      }
+      handleBOM() {
+        const first = this.peekBufferedByte(0);
+        const second = this.peekBufferedByte(1);
+        const third = this.peekBufferedByte(2);
+        if (second === void 0) {
+          if (first === BOM[0]) {
+            return true;
+          }
+          this.checkBOM = false;
+          return true;
+        }
+        if (third === void 0) {
+          if (first === BOM[0] && second === BOM[1]) {
+            return true;
+          }
+          this.checkBOM = false;
+          return false;
+        }
+        if (first === BOM[0] && second === BOM[1] && third === BOM[2]) {
+          this.discardLeadingBytes(3);
+        }
+        this.checkBOM = false;
+        return !this.hasCurrentByte();
       }
     };
     module2.exports = {
@@ -20088,7 +20221,7 @@ function parseResolved(filePath) {
     return pins.map((pin) => ({
       identity: identityFromUrl(pin.repositoryURL),
       location: pin.repositoryURL,
-      state: pin.state ?? void 0
+      state: pin.state
     }));
   }
   return Array.isArray(parsed.pins) ? parsed.pins : [];
@@ -20099,10 +20232,6 @@ function resolveVersion(state) {
     return state.revision ? `${state.branch}+${state.revision.slice(0, 7)}` : state.branch;
   }
   return state?.revision ?? "";
-}
-function getPackages(filePath) {
-  const pins = parseResolved(filePath);
-  return new Map(pins.map((pin) => [pin.identity, resolveVersion(pin.state)]));
 }
 function getPackagesWithInfo(filePath) {
   const pins = parseResolved(filePath);
@@ -20115,6 +20244,9 @@ function getPackagesWithInfo(filePath) {
       }
     ])
   );
+}
+function toVersionMap(info2) {
+  return new Map([...info2].map(([identity, { version }]) => [identity, version]));
 }
 function compareVersionParts(a, b) {
   for (let i = 0; i < 3; i++) {
@@ -20209,16 +20341,12 @@ function walkDirs(rootDir, excludeDir, visit) {
   }
   scan(rootDir);
 }
-function findPackageSwiftFiles(rootDir, excludeDir) {
-  const results = [];
-  walkDirs(rootDir, excludeDir, (dir, entries) => {
-    for (const entry of entries) {
-      if (entry.isFile() && entry.name === "Package.swift") {
-        results.push(import_path.default.join(dir, entry.name));
-      }
-    }
-  });
-  return results;
+function readTextOrNull(filePath) {
+  try {
+    return import_fs2.default.readFileSync(filePath, "utf8");
+  } catch {
+    return null;
+  }
 }
 function extractBlocks(content, keyword) {
   const blocks = [];
@@ -20287,12 +20415,8 @@ function extractPbxObjectBlocks(content) {
   return blocks;
 }
 function detectXcodeDevPackages(pbxprojPath) {
-  let content;
-  try {
-    content = import_fs2.default.readFileSync(pbxprojPath, "utf8");
-  } catch {
-    return { devRefs: /* @__PURE__ */ new Set(), appRefs: /* @__PURE__ */ new Set() };
-  }
+  const content = readTextOrNull(pbxprojPath);
+  if (content === null) return { devRefs: /* @__PURE__ */ new Set(), appRefs: /* @__PURE__ */ new Set() };
   const remoteRefToIdentity = /* @__PURE__ */ new Map();
   for (const m of content.matchAll(
     /(\w{24}) \/\* XCRemoteSwiftPackageReference "[^"]*" \*\/ = \{[^}]*repositoryURL = "([^"]+)"/g
@@ -20303,11 +20427,8 @@ function detectXcodeDevPackages(pbxprojPath) {
   for (const m of content.matchAll(
     /(\w{24}) \/\* \S+ \*\/ = \{\s*isa = XCSwiftPackageProductDependency;\s*(?:package = (\w+) [^;]+;\s*)?productName = [^;]+;/g
   )) {
-    const depId = m[1];
-    const pkgRef = m[2];
-    if (pkgRef && remoteRefToIdentity.has(pkgRef)) {
-      prodDepToIdentity.set(depId, remoteRefToIdentity.get(pkgRef));
-    }
+    const identity = m[2] && remoteRefToIdentity.get(m[2]);
+    if (identity) prodDepToIdentity.set(m[1], identity);
   }
   const devRefs = /* @__PURE__ */ new Set();
   const appRefs = /* @__PURE__ */ new Set();
@@ -20326,35 +20447,33 @@ function detectXcodeDevPackages(pbxprojPath) {
     }
   }
   for (const identity of remoteRefToIdentity.values()) {
-    if (!appRefs.has(identity) && !devRefs.has(identity)) {
-      devRefs.add(identity);
-    }
+    if (!appRefs.has(identity)) devRefs.add(identity);
   }
   return { devRefs, appRefs };
 }
-function findPbxprojFiles(rootDir, excludeDir) {
-  const results = [];
-  walkDirs(rootDir, excludeDir, (dir, entries) => {
+function scanProject(projectRoot, excludeDir) {
+  const scan = { manifests: [], xcodeDevRefs: /* @__PURE__ */ new Set(), xcodeAppRefs: /* @__PURE__ */ new Set() };
+  walkDirs(projectRoot, excludeDir, (dir, entries) => {
     for (const entry of entries) {
-      if (entry.isDirectory() && entry.name.endsWith(".xcodeproj")) {
-        const candidate = import_path.default.join(dir, entry.name, "project.pbxproj");
-        if (import_fs2.default.existsSync(candidate)) results.push(candidate);
+      if (entry.isFile() && entry.name === "Package.swift") {
+        const content = readTextOrNull(import_path.default.join(dir, entry.name));
+        if (content !== null) scan.manifests.push(content);
+      } else if (entry.isDirectory() && entry.name.endsWith(".xcodeproj")) {
+        const pbxprojPath = import_path.default.join(dir, entry.name, "project.pbxproj");
+        if (!import_fs2.default.existsSync(pbxprojPath)) continue;
+        const { devRefs, appRefs } = detectXcodeDevPackages(pbxprojPath);
+        for (const ref of devRefs) scan.xcodeDevRefs.add(ref);
+        for (const ref of appRefs) scan.xcodeAppRefs.add(ref);
       }
     }
   });
-  return results;
+  return scan;
 }
 var APP_TARGET_KEYWORDS = ["target", "executableTarget", "macro"];
-function detectDevPackages(resolvedFilePath, projectRoot, excludeDir) {
-  const devRefs = /* @__PURE__ */ new Set();
-  const appRefs = /* @__PURE__ */ new Set();
-  for (const filePath of findPackageSwiftFiles(projectRoot, excludeDir)) {
-    let content;
-    try {
-      content = import_fs2.default.readFileSync(filePath, "utf8");
-    } catch {
-      continue;
-    }
+function detectDevPackages(resolvedSet, scan) {
+  const devRefs = new Set(scan.xcodeDevRefs);
+  const appRefs = new Set(scan.xcodeAppRefs);
+  for (const content of scan.manifests) {
     for (const block of extractBlocks(content, "testTarget")) {
       for (const ref of packageRefs(block, "product")) devRefs.add(ref);
     }
@@ -20367,19 +20486,7 @@ function detectDevPackages(resolvedFilePath, projectRoot, excludeDir) {
       }
     }
   }
-  for (const pbxprojPath of findPbxprojFiles(projectRoot, excludeDir)) {
-    const { devRefs: pbxDev, appRefs: pbxApp } = detectXcodeDevPackages(pbxprojPath);
-    for (const ref of pbxDev) devRefs.add(ref);
-    for (const ref of pbxApp) appRefs.add(ref);
-  }
-  const resolved = getPackagesWithInfo(resolvedFilePath);
-  const result = /* @__PURE__ */ new Set();
-  for (const ref of devRefs) {
-    if (!appRefs.has(ref) && resolved.has(ref)) {
-      result.add(ref);
-    }
-  }
-  return result;
+  return new Set([...devRefs].filter((ref) => !appRefs.has(ref) && resolvedSet.has(ref)));
 }
 function manifestPackageDeps(content) {
   const deps = [];
@@ -20389,26 +20496,9 @@ function manifestPackageDeps(content) {
   }
   return deps;
 }
-function getDirectDependencies(resolvedSet, projectRoot, excludeDir) {
-  const direct = /* @__PURE__ */ new Set();
-  for (const filePath of findPackageSwiftFiles(projectRoot, excludeDir)) {
-    let content;
-    try {
-      content = import_fs2.default.readFileSync(filePath, "utf8");
-    } catch {
-      continue;
-    }
-    for (const ref of manifestPackageDeps(content)) {
-      if (resolvedSet.has(ref)) direct.add(ref);
-    }
-  }
-  for (const pbxprojPath of findPbxprojFiles(projectRoot, excludeDir)) {
-    const { devRefs, appRefs } = detectXcodeDevPackages(pbxprojPath);
-    for (const ref of [...devRefs, ...appRefs]) {
-      if (resolvedSet.has(ref)) direct.add(ref);
-    }
-  }
-  return direct;
+function getDirectDependencies(resolvedSet, scan) {
+  const referenced = [...scan.manifests.flatMap(manifestPackageDeps), ...scan.xcodeDevRefs, ...scan.xcodeAppRefs];
+  return new Set(referenced.filter((ref) => resolvedSet.has(ref)));
 }
 function getDependencyEdges(checkoutsDir, resolvedSet) {
   const edges = /* @__PURE__ */ new Map();
@@ -20422,12 +20512,8 @@ function getDependencyEdges(checkoutsDir, resolvedSet) {
     if (!entry.isDirectory()) continue;
     const identity = entry.name.toLowerCase();
     if (!resolvedSet.has(identity)) continue;
-    let content;
-    try {
-      content = import_fs2.default.readFileSync(import_path.default.join(checkoutsDir, entry.name, "Package.swift"), "utf8");
-    } catch {
-      continue;
-    }
+    const content = readTextOrNull(import_path.default.join(checkoutsDir, entry.name, "Package.swift"));
+    if (content === null) continue;
     const children = [...new Set(manifestPackageDeps(content))].filter(
       (child2) => child2 !== identity && resolvedSet.has(child2)
     );
@@ -20460,9 +20546,9 @@ function generateMermaidGraph(afterInfo, directDeps, edges) {
   lines.push("  classDef direct fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;");
   return lines.join("\n");
 }
-function buildDependencyGraph(afterInfo, projectRoot, checkoutsDir, excludeDir) {
+function buildDependencyGraph(afterInfo, scan, checkoutsDir) {
   const resolvedSet = new Set(afterInfo.keys());
-  const directDeps = getDirectDependencies(resolvedSet, projectRoot, excludeDir);
+  const directDeps = getDirectDependencies(resolvedSet, scan);
   const edges = getDependencyEdges(checkoutsDir, resolvedSet);
   return generateMermaidGraph(afterInfo, directDeps, edges);
 }
@@ -20601,9 +20687,6 @@ ${graphSection}
 function escapeHtml(str) {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-function getToolVersion() {
-  return true ? "4.0.3" : readOwnPackageVersion();
-}
 function normalizeGitUrl(url) {
   const scpMatch = /^([\w.-]+)@([\w.-]+):(.+)$/.exec(url);
   return scpMatch ? `ssh://${scpMatch[1]}@${scpMatch[2]}/${scpMatch[3]}` : url;
@@ -20639,7 +20722,7 @@ function generateSbom(afterInfo, devPackages = /* @__PURE__ */ new Set()) {
     version: 1,
     metadata: {
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-      tools: [{ name: "xcode-packages-update", version: getToolVersion() }]
+      tools: [{ name: "xcode-packages-update", version: "4.0.7" }]
     },
     components
   };
@@ -20704,13 +20787,10 @@ async function run() {
   if (scheme && !workspaceFile) {
     warning("scheme input is ignored when project_file is used without workspace_file.");
   }
-  if (workspaceFile && scheme) {
-    const schemePath = findSharedScheme(workspaceFile, scheme);
-    if (!schemePath) {
-      throw new Error(
-        `Scheme "${scheme}" was not found in "${workspaceFile}" or any referenced project. Make sure the scheme exists and is marked as shared in Xcode (Product \u2192 Scheme \u2192 Manage Schemes \u2192 check "Shared").`
-      );
-    }
+  if (workspaceFile && !findSharedScheme(workspaceFile, scheme)) {
+    throw new Error(
+      `Scheme "${scheme}" was not found in "${workspaceFile}" or any referenced project. Make sure the scheme exists and is marked as shared in Xcode (Product \u2192 Scheme \u2192 Manage Schemes \u2192 check "Shared").`
+    );
   }
   const packageResolved = workspaceFile ? `${workspaceFile}/xcshareddata/swiftpm/Package.resolved` : `${projectFile}/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`;
   const snapshotDir = process.env.RUNNER_TEMP || import_os3.default.tmpdir();
@@ -20733,14 +20813,17 @@ async function run() {
     tempDir
   ];
   await exec("xcodebuild", xcodebuildArgs);
-  const before = hadExistingResolved ? getPackages(currentPackage) : /* @__PURE__ */ new Map();
-  const after = getPackages(packageResolved);
-  const { removed, added, updated } = comparePackages(before, after);
+  const beforeInfo = hadExistingResolved ? getPackagesWithInfo(currentPackage) : /* @__PURE__ */ new Map();
+  const afterInfo = getPackagesWithInfo(packageResolved);
+  const before = toVersionMap(beforeInfo);
+  const after = toVersionMap(afterInfo);
+  const diff = comparePackages(before, after);
+  const { removed, added, updated } = diff;
   if (htmlReportPath || sbomPath) {
-    const projectRoot = import_path2.default.resolve(projectFile ? import_path2.default.dirname(projectFile) : import_path2.default.dirname(workspaceFile));
-    const devPackages = devPackagesInput ? parseDevPackages(devPackagesInput) : detectDevPackages(packageResolved, projectRoot, tempDir);
-    const beforeInfo = hadExistingResolved ? getPackagesWithInfo(currentPackage) : /* @__PURE__ */ new Map();
-    const afterInfo = getPackagesWithInfo(packageResolved);
+    const projectRoot = import_path2.default.resolve(import_path2.default.dirname(projectFile || workspaceFile));
+    let scan;
+    const getScan = () => scan ??= scanProject(projectRoot, tempDir);
+    const devPackages = devPackagesInput ? parseDevPackages(devPackagesInput) : detectDevPackages(new Set(afterInfo.keys()), getScan());
     if (htmlReportPath) {
       const runGit = async (command, args) => {
         const { stdout } = await getExecOutput(command, args, {
@@ -20751,15 +20834,8 @@ async function run() {
         return stdout;
       };
       const latest = await getLatestVersions(afterInfo, runGit);
-      const mermaid = buildDependencyGraph(afterInfo, projectRoot, import_path2.default.join(tempDir, "checkouts"), tempDir);
-      const html = generateHtmlReport(
-        beforeInfo,
-        afterInfo,
-        { removed, added, updated },
-        devPackages,
-        latest,
-        mermaid
-      );
+      const mermaid = buildDependencyGraph(afterInfo, getScan(), import_path2.default.join(tempDir, "checkouts"));
+      const html = generateHtmlReport(beforeInfo, afterInfo, diff, devPackages, latest, mermaid);
       writeToPath(htmlReportPath, html);
       setOutput("html_report_path", htmlReportPath);
       info(`HTML dependency report written to ${htmlReportPath}`);
