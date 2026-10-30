@@ -1,6 +1,6 @@
 {
   "name": "xcode-packages-update",
-  "version": "4.0.7",
+  "version": "4.0.9",
   "description": "Resolves Xcode SPM dependencies and reports what changed",
   "type": "module",
   "engines": {
@@ -28,7 +28,7 @@
     "globals": "^17.13.0",
     "prettier": "^3.9.10",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.72.0",
+    "typescript-eslint": "^8.72.1",
     "vitest": "^5.0.0"
   },
   "allowScripts": {
